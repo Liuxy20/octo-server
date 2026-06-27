@@ -4,6 +4,15 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-06-27
+
+- **Fix** — Task `dm-space-isolation-484` (#484): authoritative per-Space DM
+  presence index (`dm_space_presence`, written at the WuKongIM message webhook,
+  read by the conversation Space filter) — fixes cross-Space DM history leak
+  (symptom 1, via default-Space policy for untagged messages) and DMs mutually
+  hiding between Spaces (symptom 2, window-independent visibility OR-ed with the
+  legacy Recents scan). Server-only; no client change.
+
 ## 2026-06-25
 
 - **Add** — Task `incoming-webhook-mention-config`: moved the incoming-webhook

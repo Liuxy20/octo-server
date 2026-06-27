@@ -27,6 +27,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
@@ -1276,7 +1277,9 @@ func (m *Message) syncChannelMessage(c *wkhttp.Context) {
 	// 否则 hardening 会被绕过。
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		if spaceID := spacepkg.GetSpaceID(c); spaceID != "" {
-			syncResp.Messages = filterPersonMessagesBySpace(syncResp.Messages, req.ChannelID, spaceID)
+			// issue #484：无标签 DM 历史只在用户默认 Space 保留，避免跨 Space 泄漏。
+			defaultSpaceID := space.GetUserDefaultSpaceID(m.ctx, req.LoginUID)
+			syncResp.Messages = filterPersonMessagesBySpace(syncResp.Messages, req.ChannelID, spaceID, defaultSpaceID)
 		}
 	}
 

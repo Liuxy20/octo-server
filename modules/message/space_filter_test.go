@@ -17,7 +17,7 @@ func TestFilterConversationsBySpace_DirectMatch(t *testing.T) {
 	}
 
 	// 所有会话都有 SpaceID，不触发 bareGroupNos / bareDMUIDs 逻辑
-	result := filterConversationsCore(convs, "spaceA", "spaceA", nil, nil, nil, nil, false, false)
+	result := filterConversationsCore(convs, "spaceA", "spaceA", nil, nil, nil, nil, false, false, nil)
 	assert.Len(t, result, 2)
 	assert.Equal(t, "g1", result[0].ChannelID)
 	assert.Equal(t, "u1", result[1].ChannelID)
@@ -37,7 +37,7 @@ func TestFilterConversationsBySpace_SystemBotsVisible(t *testing.T) {
 	// 传入 botSet 标记 custom_bot 为 Bot，且不在此 Space → 不显示
 	botSet := map[string]bool{"custom_bot": true}
 	botInSpace := map[string]bool{}
-	result := filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, botSet, botInSpace, false, false)
+	result := filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, botSet, botInSpace, false, false, nil)
 	// 系统 Bot 可见，custom_bot（Bot 不在此 Space）不可见
 	assert.Len(t, result, 3)
 	ids := []string{result[0].ChannelID, result[1].ChannelID, result[2].ChannelID}
@@ -54,11 +54,11 @@ func TestFilterConversationsBySpace_DefaultSpaceBareConvs(t *testing.T) {
 	}
 
 	// filterSpaceID == defaultSpaceID → 旧会话保留
-	result := filterConversationsCore(convs, "spaceA", "spaceA", nil, nil, nil, nil, false, false)
+	result := filterConversationsCore(convs, "spaceA", "spaceA", nil, nil, nil, nil, false, false, nil)
 	assert.Len(t, result, 2)
 
 	// filterSpaceID != defaultSpaceID → 无 Recents 匹配 → 不显示
-	result = filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, nil, nil, false, false)
+	result = filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, nil, nil, false, false, nil)
 	assert.Len(t, result, 0)
 }
 
@@ -81,7 +81,7 @@ func TestFilterConversationsBySpace_NonDefaultSpaceDMVisible(t *testing.T) {
 	botInSpace := map[string]bool{"bot_in_space": true}
 
 	// filterSpaceID=spaceB != defaultSpaceID=spaceA
-	result := filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, botSet, botInSpace, false, false)
+	result := filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, botSet, botInSpace, false, false, nil)
 
 	// user1（Recents 有 spaceB 消息）保留；user2（Recents 只有 spaceA）过滤；
 	// bot_in_space（Bot 在此 Space）保留；custom_bot（Bot 不在此 Space）不保留
@@ -113,10 +113,33 @@ func TestFilterConversationsBySpace_NewSpaceCleanSlate(t *testing.T) {
 		},
 	}
 
-	result := filterConversationsCore(convs, "spaceNew", "spaceA", nil, nil, map[string]bool{}, map[string]bool{}, false, false)
+	result := filterConversationsCore(convs, "spaceNew", "spaceA", nil, nil, map[string]bool{}, map[string]bool{}, false, false, nil)
 
 	// 新 Space 没有任何 DM 有匹配消息 → clean slate
 	assert.Len(t, result, 0)
+}
+
+func TestFilterConversationsCore_DMPresenceVisibilityWindowIndependent(t *testing.T) {
+	// issue #484：非默认 Space 下，DM 即使 Recents 窗口被其他 Space 挤满（没有本
+	// Space 的消息），只要 dm_space_presence 命中（dmPresentSet 含该对端），也应
+	// 可见——窗口无关的权威可见性，修复症状2（DM 互斥消失）。
+	convs := []*SyncUserConversationResp{
+		{
+			ChannelID: "peerX", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: "",
+			// Recents 窗口只有 spaceC 的消息，没有 spaceB
+			Recents: []*MsgSyncResp{{Payload: map[string]interface{}{"space_id": "spaceC", "content": "hi"}}},
+		},
+	}
+
+	// 无 presence（nil）→ 回退 Recents 扫描 → spaceB 下不可见（症状2 原状）。
+	hidden := filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, nil, nil, false, false, nil)
+	assert.Len(t, hidden, 0)
+
+	// 有 presence（peerX 在 spaceB 有过消息）→ 窗口无关，spaceB 下可见。
+	present := map[string]bool{"peerX": true}
+	visible := filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, nil, nil, false, false, present)
+	assert.Len(t, visible, 1)
+	assert.Equal(t, "peerX", visible[0].ChannelID)
 }
 
 func TestPersonConvHasSpaceMessages(t *testing.T) {
@@ -152,7 +175,7 @@ func TestFilterConversationsBySpace_GroupSpaceMap(t *testing.T) {
 	}
 	groupMap := map[string]string{"g1": "spaceA", "g2": "spaceB"}
 
-	result := filterConversationsCore(convs, "spaceA", "spaceA", groupMap, nil, nil, nil, false, false)
+	result := filterConversationsCore(convs, "spaceA", "spaceA", groupMap, nil, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
 	assert.Equal(t, "g1", result[0].ChannelID)
 }
@@ -165,7 +188,7 @@ func TestFilterConversationsBySpace_SkipGroupFilter(t *testing.T) {
 		{ChannelID: "u1", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: "spaceA"},
 	}
 
-	result := filterConversationsCore(convs, "spaceA", "spaceA", nil, nil, nil, nil, true, false)
+	result := filterConversationsCore(convs, "spaceA", "spaceA", nil, nil, nil, nil, true, false, nil)
 	// g1, g2 保留（skipGroupFilter），u1 保留（直接匹配）
 	assert.Len(t, result, 3)
 }
@@ -179,16 +202,16 @@ func TestFilterConversationsBySpace_ExternalGroupVisibleInSourceSpace(t *testing
 	externalMap := map[string]string{"gExt": "spaceB"}
 
 	// 在 source Space（B）下可见
-	result := filterConversationsCore(convs, "spaceB", "spaceB", nil, externalMap, nil, nil, false, false)
+	result := filterConversationsCore(convs, "spaceB", "spaceB", nil, externalMap, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
 	assert.Equal(t, "gExt", result[0].ChannelID)
 
 	// 在群的原生 Space（A）下也可见
-	result = filterConversationsCore(convs, "spaceA", "spaceB", nil, externalMap, nil, nil, false, false)
+	result = filterConversationsCore(convs, "spaceA", "spaceB", nil, externalMap, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
 
 	// 在无关 Space（C）下不可见
-	result = filterConversationsCore(convs, "spaceC", "spaceB", nil, externalMap, nil, nil, false, false)
+	result = filterConversationsCore(convs, "spaceC", "spaceB", nil, externalMap, nil, nil, false, false, nil)
 	assert.Len(t, result, 0)
 }
 
@@ -201,7 +224,7 @@ func TestFilterConversationsBySpace_ExternalGroupFallbackToDefault(t *testing.T)
 	externalMap := map[string]string{"gExt": ""} // source Space 记录已失效
 
 	// defaultSpaceID=spaceB，fallback 后在 spaceB 可见
-	result := filterConversationsCore(convs, "spaceB", "spaceB", nil, externalMap, nil, nil, false, false)
+	result := filterConversationsCore(convs, "spaceB", "spaceB", nil, externalMap, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
 }
 
@@ -211,10 +234,10 @@ func TestFilterConversationsBySpace_ThreadChannelInParentGroupSpace(t *testing.T
 	}
 	groupMap := map[string]string{"g1": "spaceA"}
 
-	result := filterConversationsCore(convs, "spaceA", "spaceDefault", groupMap, nil, nil, nil, false, false)
+	result := filterConversationsCore(convs, "spaceA", "spaceDefault", groupMap, nil, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
 
-	result = filterConversationsCore(convs, "spaceB", "spaceDefault", groupMap, nil, nil, nil, false, false)
+	result = filterConversationsCore(convs, "spaceB", "spaceDefault", groupMap, nil, nil, nil, false, false, nil)
 	assert.Len(t, result, 0)
 }
 
@@ -225,7 +248,7 @@ func TestFilterConversationsBySpace_ThreadChannelNoLeakInDefaultSpace(t *testing
 	}
 	groupMap := map[string]string{"g1": "spaceA"}
 
-	result := filterConversationsCore(convs, "spaceDefault", "spaceDefault", groupMap, nil, nil, nil, false, false)
+	result := filterConversationsCore(convs, "spaceDefault", "spaceDefault", groupMap, nil, nil, nil, false, false, nil)
 	assert.Len(t, result, 0)
 }
 
@@ -236,13 +259,13 @@ func TestFilterConversationsBySpace_ThreadChannelExternalGroup(t *testing.T) {
 	groupMap := map[string]string{"gExt": "spaceA"}
 	externalMap := map[string]string{"gExt": "spaceB"}
 
-	result := filterConversationsCore(convs, "spaceB", "spaceDefault", groupMap, externalMap, nil, nil, false, false)
+	result := filterConversationsCore(convs, "spaceB", "spaceDefault", groupMap, externalMap, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
 
-	result = filterConversationsCore(convs, "spaceA", "spaceDefault", groupMap, externalMap, nil, nil, false, false)
+	result = filterConversationsCore(convs, "spaceA", "spaceDefault", groupMap, externalMap, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
 
-	result = filterConversationsCore(convs, "spaceC", "spaceDefault", groupMap, externalMap, nil, nil, false, false)
+	result = filterConversationsCore(convs, "spaceC", "spaceDefault", groupMap, externalMap, nil, nil, false, false, nil)
 	assert.Len(t, result, 0)
 }
 
@@ -256,11 +279,11 @@ func TestFilterConversationsBySpace_ThreadChannelExternalOnly(t *testing.T) {
 	externalMap := map[string]string{"gExt": "spaceB"}
 
 	// filter=spaceB 只能通过 external 路径命中
-	result := filterConversationsCore(convs, "spaceB", "spaceDefault", groupMap, externalMap, nil, nil, false, false)
+	result := filterConversationsCore(convs, "spaceB", "spaceDefault", groupMap, externalMap, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
 
 	// filter=spaceHome 只能通过直接匹配命中（不走 external）
-	result = filterConversationsCore(convs, "spaceHome", "spaceDefault", groupMap, externalMap, nil, nil, false, false)
+	result = filterConversationsCore(convs, "spaceHome", "spaceDefault", groupMap, externalMap, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
 }
 
@@ -271,7 +294,7 @@ func TestFilterConversationsBySpace_ThreadChannelExternalFallback(t *testing.T) 
 	groupMap := map[string]string{"gExt": "spaceA"}
 	externalMap := map[string]string{"gExt": ""}
 
-	result := filterConversationsCore(convs, "spaceDefault", "spaceDefault", groupMap, externalMap, nil, nil, false, false)
+	result := filterConversationsCore(convs, "spaceDefault", "spaceDefault", groupMap, externalMap, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
 }
 
@@ -280,9 +303,9 @@ func TestFilterConversationsBySpace_ThreadChannelLegacyParent(t *testing.T) {
 	convs := []*SyncUserConversationResp{
 		{ChannelID: "gLegacy____123456789012345", ChannelType: common.ChannelTypeCommunityTopic.Uint8(), SpaceID: ""},
 	}
-	result := filterConversationsCore(convs, "spaceA", "spaceDefault", map[string]string{}, nil, nil, nil, false, false)
+	result := filterConversationsCore(convs, "spaceA", "spaceDefault", map[string]string{}, nil, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
-	result = filterConversationsCore(convs, "spaceB", "spaceDefault", map[string]string{}, nil, nil, nil, false, false)
+	result = filterConversationsCore(convs, "spaceB", "spaceDefault", map[string]string{}, nil, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
 }
 
@@ -293,7 +316,7 @@ func TestFilterConversationsBySpace_ThreadChannelInvalidID(t *testing.T) {
 	}
 	groupMap := map[string]string{"g1": "spaceA"}
 
-	result := filterConversationsCore(convs, "spaceA", "spaceDefault", groupMap, nil, nil, nil, false, false)
+	result := filterConversationsCore(convs, "spaceA", "spaceDefault", groupMap, nil, nil, nil, false, false, nil)
 	assert.Len(t, result, 1)
 	assert.Equal(t, "g1____123456789012345", result[0].ChannelID)
 }
@@ -303,7 +326,7 @@ func TestFilterConversationsBySpace_ThreadChannelSkipGroupFilter(t *testing.T) {
 		{ChannelID: "g1____123456789012345", ChannelType: common.ChannelTypeCommunityTopic.Uint8(), SpaceID: ""},
 		{ChannelID: "g2____987654321098765", ChannelType: common.ChannelTypeCommunityTopic.Uint8(), SpaceID: ""},
 	}
-	result := filterConversationsCore(convs, "spaceA", "spaceDefault", nil, nil, nil, nil, true, false)
+	result := filterConversationsCore(convs, "spaceA", "spaceDefault", nil, nil, nil, nil, true, false, nil)
 	assert.Len(t, result, 2)
 }
 
@@ -509,7 +532,7 @@ func TestSyncPipeline_SystemBotsAlwaysReturned(t *testing.T) {
 			cp := *c
 			in[i] = &cp
 		}
-		filtered := filterConversationsCore(in, filterSpaceID, defaultSpaceID, groupMap, nil, nil, nil, false, false)
+		filtered := filterConversationsCore(in, filterSpaceID, defaultSpaceID, groupMap, nil, nil, nil, false, false, nil)
 		return EnsureSystemBotsPresent(filtered)
 	}
 
@@ -571,7 +594,7 @@ func TestFilterPersonMessagesBySpace_SystemBot(t *testing.T) {
 		newMsgWithSpaceID(4, "spaceA"),
 	}
 
-	got := filterPersonMessagesBySpace(msgs, "botfather", "spaceA")
+	got := filterPersonMessagesBySpace(msgs, "botfather", "spaceA", "spaceA")
 	assert.Len(t, got, 2)
 	assert.Equal(t, int64(1), got[0].MessageID)
 	assert.Equal(t, int64(4), got[1].MessageID)
@@ -589,12 +612,34 @@ func TestFilterPersonMessagesBySpace_OrdinaryDMLegacyCompat(t *testing.T) {
 		newMsgWithSpaceID(12, "spaceB"),
 	}
 
-	got := filterPersonMessagesBySpace(msgs, "peer_uid", "spaceA")
+	got := filterPersonMessagesBySpace(msgs, "peer_uid", "spaceA", "spaceA")
 	assert.Len(t, got, 2)
 	ids := []int64{got[0].MessageID, got[1].MessageID}
 	assert.Contains(t, ids, int64(10))
 	assert.Contains(t, ids, int64(11))
 	assert.NotContains(t, ids, int64(12))
+}
+
+func TestFilterPersonMessagesBySpace_UntaggedDroppedInNonDefaultSpace(t *testing.T) {
+	// issue #484：无 space_id 的普通 DM 消息只在默认 Space 保留；在非默认 Space
+	// （spaceID != defaultSpaceID）下必须丢弃，避免跨 Space 历史泄漏（症状1）。
+	msgs := []*MsgSyncResp{
+		newMsgWithSpaceID(80, "spaceB"), // 当前 Space 的消息 → 保留
+		newMsgWithSpaceID(81, ""),       // 无标签老消息 → 非默认 Space 丢弃
+		newMsgWithSpaceID(82, "spaceC"), // 跨 Space → 丢弃
+	}
+	// filterSpaceID=spaceB, defaultSpaceID=spaceDefault（不相等）
+	got := filterPersonMessagesBySpace(msgs, "peer_uid", "spaceB", "spaceDefault")
+	assert.Len(t, got, 1)
+	assert.Equal(t, int64(80), got[0].MessageID)
+
+	// 同一批消息在默认 Space（spaceID==defaultSpaceID）下，无标签消息仍保留。
+	gotDefault := filterPersonMessagesBySpace(msgs, "peer_uid", "spaceDefault", "spaceDefault")
+	ids := make([]int64, len(gotDefault))
+	for i, m := range gotDefault {
+		ids[i] = m.MessageID
+	}
+	assert.Contains(t, ids, int64(81), "无标签消息在默认 Space 保留")
 }
 
 func TestFilterPersonMessagesBySpace_CrossSpaceDropped(t *testing.T) {
@@ -603,7 +648,7 @@ func TestFilterPersonMessagesBySpace_CrossSpaceDropped(t *testing.T) {
 		newMsgWithSpaceID(20, "spaceB"),
 		newMsgWithSpaceID(21, "spaceB"),
 	}
-	got := filterPersonMessagesBySpace(msgs, "peer_uid", "spaceA")
+	got := filterPersonMessagesBySpace(msgs, "peer_uid", "spaceA", "spaceA")
 	assert.Len(t, got, 0)
 }
 
@@ -614,7 +659,7 @@ func TestFilterPersonMessagesBySpace_AllInSpaceKept(t *testing.T) {
 		newMsgWithSpaceID(31, "spaceA"),
 		newMsgWithSpaceID(32, "spaceA"),
 	}
-	got := filterPersonMessagesBySpace(msgs, "peer_uid", "spaceA")
+	got := filterPersonMessagesBySpace(msgs, "peer_uid", "spaceA", "spaceA")
 	assert.Len(t, got, 3)
 }
 
@@ -626,16 +671,16 @@ func TestFilterPersonMessagesBySpace_EmptySpaceIDNoOp(t *testing.T) {
 		newMsgWithSpaceID(41, ""),
 		newMsgWithSpaceID(42, "spaceB"),
 	}
-	got := filterPersonMessagesBySpace(msgs, "botfather", "")
+	got := filterPersonMessagesBySpace(msgs, "botfather", "", "")
 	assert.Equal(t, msgs, got)
 }
 
 func TestFilterPersonMessagesBySpace_EmptySliceReturnsSame(t *testing.T) {
-	got := filterPersonMessagesBySpace(nil, "botfather", "spaceA")
+	got := filterPersonMessagesBySpace(nil, "botfather", "spaceA", "spaceA")
 	assert.Nil(t, got)
 
 	empty := []*MsgSyncResp{}
-	got = filterPersonMessagesBySpace(empty, "botfather", "spaceA")
+	got = filterPersonMessagesBySpace(empty, "botfather", "spaceA", "spaceA")
 	assert.Equal(t, empty, got)
 }
 
@@ -647,7 +692,7 @@ func TestFilterPersonMessagesBySpace_NilMessagesSkipped(t *testing.T) {
 		nil,
 		newMsgWithSpaceID(51, "spaceB"),
 	}
-	got := filterPersonMessagesBySpace(msgs, "peer_uid", "spaceA")
+	got := filterPersonMessagesBySpace(msgs, "peer_uid", "spaceA", "spaceA")
 	assert.Len(t, got, 1)
 	assert.Equal(t, int64(50), got[0].MessageID)
 }
@@ -658,11 +703,11 @@ func TestFilterPersonMessagesBySpace_PayloadSpaceIDWrongType(t *testing.T) {
 	msgA := &MsgSyncResp{MessageID: 60, Payload: map[string]interface{}{"space_id": 123}}
 
 	// 普通 DM：保留
-	got := filterPersonMessagesBySpace([]*MsgSyncResp{msgA}, "peer_uid", "spaceA")
+	got := filterPersonMessagesBySpace([]*MsgSyncResp{msgA}, "peer_uid", "spaceA", "spaceA")
 	assert.Len(t, got, 1)
 
 	// SystemBot：丢弃
-	got = filterPersonMessagesBySpace([]*MsgSyncResp{msgA}, "fileHelper", "spaceA")
+	got = filterPersonMessagesBySpace([]*MsgSyncResp{msgA}, "fileHelper", "spaceA", "spaceA")
 	assert.Len(t, got, 0)
 }
 
@@ -670,7 +715,7 @@ func TestFilterPersonMessagesBySpace_SystemBotListCoverage(t *testing.T) {
 	// 保证三个已知系统 Bot 都走 SystemBot 分支（老消息被丢弃）。
 	msgs := []*MsgSyncResp{newMsgWithSpaceID(70, "")}
 	for _, bot := range spacepkg.SystemBotList() {
-		got := filterPersonMessagesBySpace(msgs, bot, "spaceA")
+		got := filterPersonMessagesBySpace(msgs, bot, "spaceA", "spaceA")
 		assert.Emptyf(t, got, "SystemBot %s 的无 space_id 消息应被丢弃", bot)
 	}
 }

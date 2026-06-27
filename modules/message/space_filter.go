@@ -100,7 +100,43 @@ func FilterConversationsBySpace(
 		loginUID, groupService,
 	)
 
-	return filterConversationsCore(conversations, filterSpaceID, defaultSpaceID, groupSpaceMap, externalGroupMap, botSet, botInSpace, skipGroupFilter, skipBotFilter)
+	// issue #484：DM per-Space 存在性（窗口无关的权威信号）。
+	dmPresentSet := resolveDMPresence(ctx, loginUID, filterSpaceID, bareDMUIDs)
+
+	return filterConversationsCore(conversations, filterSpaceID, defaultSpaceID, groupSpaceMap, externalGroupMap, botSet, botInSpace, skipGroupFilter, skipBotFilter, dmPresentSet)
+}
+
+// resolveDMPresence 批量解析 DM 在 filterSpaceID 下的存在性（issue #484）。
+// 输入是会话里的裸 DM 对端 UID 列表；按 common.GetFakeChannelIDWith(loginUID, peer)
+// 规范化成 dm_space_presence 的主键查询，再把命中结果回映射成“对端 UID -> true”，
+// 以便 decideConvKeepInSpace 直接用 conv.ChannelID 命中。
+//
+// 失败/空输入返回 nil（优雅降级）：读侧对 nil map 取值得 false，会回退到
+// Recents 窗口扫描的 OR 项，不比现状更差，也不会误隐藏存量 DM。
+func resolveDMPresence(ctx *config.Context, loginUID, filterSpaceID string, bareDMUIDs []string) map[string]bool {
+	if ctx == nil || loginUID == "" || filterSpaceID == "" || len(bareDMUIDs) == 0 {
+		return nil
+	}
+	fakeToPeer := make(map[string]string, len(bareDMUIDs))
+	fakeIDs := make([]string, 0, len(bareDMUIDs))
+	for _, peer := range bareDMUIDs {
+		fake := common.GetFakeChannelIDWith(loginUID, peer)
+		if _, ok := fakeToPeer[fake]; ok {
+			continue
+		}
+		fakeToPeer[fake] = peer
+		fakeIDs = append(fakeIDs, fake)
+	}
+	presentFakes, err := spacepkg.DMSpacePresenceSet(ctx.DB(), fakeIDs, filterSpaceID)
+	if err != nil {
+		log.Warn("查询 dm_space_presence 失败，回退 Recents 兜底", zap.Error(err))
+		return nil
+	}
+	out := make(map[string]bool, len(presentFakes))
+	for fake := range presentFakes {
+		out[fakeToPeer[fake]] = true
+	}
+	return out
 }
 
 // filterThreadConvsByParentMembership 剔除“调用者已不是父群成员”的子区(CommunityTopic)
@@ -185,6 +221,7 @@ func filterConversationsCore(
 	botInSpace map[string]bool,
 	skipGroupFilter bool,
 	skipBotFilter bool,
+	dmPresentSet map[string]bool,
 ) []*SyncUserConversationResp {
 	filtered := make([]*SyncUserConversationResp, 0, len(conversations))
 	for _, conv := range conversations {
@@ -195,6 +232,7 @@ func filterConversationsCore(
 			skipGroupFilter, skipBotFilter,
 			// v1 兼容：群表查询失败时不过滤（与历史 FilterConversationsBySpace 一致）。
 			false,
+			dmPresentSet,
 			func(target string) bool { return personConvHasSpaceMessages(conv, target) },
 		)
 		if keep {
@@ -216,10 +254,10 @@ func filterConversationsCore(
 //     有 payload.space_id == targetSpaceID 的消息。
 //   - failClosedOnUnknownGroupSpace: 当 skipGroupFilter=true（group service 查询
 //     失败、无法确认群的 space_id）时的语义切换。
-//     - false（v1 兼容默认）：保留群/子区，不让一次 DB 抖动影响存量行为。
-//     - true（v2 sidebar 用，PR #21 Round-6 P0-1）：drop 群/子区，避免跨 Space
-//       泄露（reviewer Jerry-Xin / yujiawei）。这是 fail-closed —— 用户多刷
-//       一次即可，但绝不让 Space A 的群在 Space B 请求里露出。
+//   - false（v1 兼容默认）：保留群/子区，不让一次 DB 抖动影响存量行为。
+//   - true（v2 sidebar 用，PR #21 Round-6 P0-1）：drop 群/子区，避免跨 Space
+//     泄露（reviewer Jerry-Xin / yujiawei）。这是 fail-closed —— 用户多刷
+//     一次即可，但绝不让 Space A 的群在 Space B 请求里露出。
 func decideConvKeepInSpace(
 	channelID string,
 	channelType uint8,
@@ -229,6 +267,7 @@ func decideConvKeepInSpace(
 	botSet, botInSpace map[string]bool,
 	skipGroupFilter, skipBotFilter bool,
 	failClosedOnUnknownGroupSpace bool,
+	dmPresentSet map[string]bool,
 	hasSpaceMsg func(targetSpaceID string) bool,
 ) bool {
 	spaceID := convSpaceID
@@ -280,6 +319,12 @@ func decideConvKeepInSpace(
 			return true
 		}
 		if !botSet[channelID] {
+			// issue #484：DM 可见性以持久化的 dm_space_presence 为权威信号，
+			// 与历史 Recents 窗口扫描 OR —— presence 解决“跨窗口被挤出而隐藏”
+			// （症状2），Recents 兜底保证存量 DM 不因尚未写索引而消失。
+			if dmPresentSet[channelID] {
+				return true
+			}
 			return hasSpaceMsg != nil && hasSpaceMsg(filterSpaceID)
 		}
 	}
@@ -430,16 +475,18 @@ func newSystemBotPlaceholder(uid string) *SyncUserConversationResp {
 // 本函数仅针对 Person (DM) 路径：
 //   - GROUP channel_id 本身做 Space 隔离（不同 Space 的群 channel_id 不同），
 //     对历史消息再过滤反而会误杀老群，因此 GROUP/COMMUNITY_TOPIC 路径不走这里。
-//   - 规则（与 Android ChatActivity.filterSystemBotMessages 口径对齐）：
-//       1) payload.space_id == spaceID               → 保留（精确匹配当前 Space）
-//       2) payload.space_id == "" && !isSystemBot    → 保留（老 DM 消息向前兼容）
-//       3) payload.space_id == "" &&  isSystemBot    → 丢弃（SystemBot 无 space
-//          标签的老消息默认隐藏，避免 fileHelper/u_10000 老消息跨 Space 泄露）
-//       4) payload.space_id != "" && != spaceID      → 丢弃（跨 Space 明确污染）
+//   - 规则（issue #484 后；与三端 SpaceFilter 口径对齐）：
+//     1) payload.space_id == spaceID                         → 保留（精确匹配）
+//     2) payload.space_id == "" && !isSystemBot && 默认Space  → 保留（无标签 DM
+//     历史只在用户默认 Space 向前兼容，避免出现在每个 Space —— 症状1）
+//     3) payload.space_id == "" && !isSystemBot && 非默认Space→ 丢弃（不再 fail-open）
+//     4) payload.space_id == "" &&  isSystemBot               → 丢弃（SystemBot 无
+//     space 标签的老消息默认隐藏，避免 fileHelper/u_10000 老消息跨 Space 泄露）
+//     5) payload.space_id != "" && != spaceID                → 丢弃（跨 Space 污染）
 //
 // 调用方需保证 spaceID != ""（空串视为未启用 Space 过滤，直接返回原列表），
-// 并只对 ChannelTypePerson 调用本函数。
-func filterPersonMessagesBySpace(msgs []*MsgSyncResp, channelID, spaceID string) []*MsgSyncResp {
+// 传入 defaultSpaceID（用户默认 Space，决定规则 2/3），并只对 ChannelTypePerson 调用。
+func filterPersonMessagesBySpace(msgs []*MsgSyncResp, channelID, spaceID, defaultSpaceID string) []*MsgSyncResp {
 	if spaceID == "" || len(msgs) == 0 {
 		return msgs
 	}
@@ -454,10 +501,14 @@ func filterPersonMessagesBySpace(msgs []*MsgSyncResp, channelID, spaceID string)
 		case msid == spaceID:
 			// 精确匹配当前 Space → 保留
 			filtered = append(filtered, m)
-		case msid == "" && !isSysBot:
-			// 老 DM 消息无 space_id 字段，向前兼容保留，避免 Phase 3 前的历史
-			// 消息被一刀切隐藏（对齐 filterConversationsCore 对普通 DM 的口径）。
+		case msid == "" && !isSysBot && spaceID == defaultSpaceID:
+			// issue #484：无 space_id 的普通 DM 消息（发送方未带 X-Space-ID、
+			// Space 化之前的老消息、转发/名片）只在用户默认 Space 向前兼容保留，
+			// 不再出现在每个 Space —— 修复症状1（跨 Space 历史泄漏）。
 			filtered = append(filtered, m)
+		case msid == "" && !isSysBot:
+			// 非默认 Space：无标签 DM 消息不再 fail-open 放行，丢弃。
+			continue
 		case msid == "" && isSysBot:
 			// 系统 Bot 的无 space_id 历史消息一律隐藏。对齐 Android
 			// filterSystemBotMessages 和 iOS filterMessagesBySpace，避免
@@ -681,6 +732,9 @@ func FilterRawConversationsBySpace(
 
 	botSet, botInSpace, skipBotFilter := resolveBotFilter(ctx, filterSpaceID, bareDMUIDs)
 
+	// issue #484：DM per-Space 存在性（与 v1 同口径，窗口无关的权威信号）。
+	dmPresentSet := resolveDMPresence(ctx, loginUID, filterSpaceID, bareDMUIDs)
+
 	filtered := make([]*config.SyncUserConversationResp, 0, len(conversations))
 	for i, conv := range conversations {
 		keep := decideConvKeepInSpace(
@@ -691,6 +745,7 @@ func FilterRawConversationsBySpace(
 			// v2 sidebar 必须 fail-closed：群表查询失败时无法确认 space，drop
 			// 群/子区以免跨 Space 泄露（PR #21 Round-6 P0-1 by Jerry-Xin / yujiawei）。
 			true,
+			dmPresentSet,
 			func(target string) bool { return rawConvHasSpaceMessages(conv, target) },
 		)
 		if keep {
