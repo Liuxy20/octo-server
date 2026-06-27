@@ -302,6 +302,37 @@ func TestRepro484_Symptom2_IsolationPreserved(t *testing.T) {
 		"isolation preserved: DM absent from a Space it has no messages in")
 }
 
+// TestRepro484_DefaultSpaceListsOtherSpaceOnlyDM confirms CURRENT (known)
+// behavior, NOT a desired end-state: the default-Space catch-all
+// (space_filter.go:305-309 decideConvKeepInSpace) lists EVERY bare DM in the
+// user's default Space, including a DM whose messages belong only to a
+// non-default Space. So `POST /v1/conversation/sync` with space_id = the user's
+// default Space surfaces other-Space DMs as entries. This is an open product
+// question (issue #484 follow-up), tracked here as a reproduction. By contrast a
+// non-default Space the DM has no messages in correctly hides it (the #484 fix).
+func TestRepro484_DefaultSpaceListsOtherSpaceOnlyDM(t *testing.T) {
+	s, _ := reproSetup(t)
+	// A DM whose ONLY recent message is spaceB-tagged (no untagged / no
+	// default-tagged content), so any default-Space visibility can ONLY come from
+	// the catch-all branch — not from legacy/untagged history.
+	reproIMConv = &config.SyncUserConversationResp{
+		ChannelID:   reproPeerUID,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Timestamp:   1700000099,
+		LastMsgSeq:  1,
+		Version:     100,
+		Recents:     []*config.MessageResp{reproMsg(1, "only-spaceB", reproSpaceB)},
+	}
+
+	inDefault := reproCallConvSync(t, s, reproSpaceDefault)
+	assert.True(t, reproContains(inDefault, reproPeerUID),
+		"KNOWN: default-Space catch-all lists a DM whose messages are only in non-default spaceB")
+
+	inC := reproCallConvSync(t, s, reproSpaceC)
+	assert.False(t, reproContains(inC, reproPeerUID),
+		"non-default spaceC (DM has no messages there) correctly hides it — the #484 fix")
+}
+
 // TestRepro484_Symptom1_UntaggedHistoryOnlyInDefaultSpace asserts the fix for
 // symptom 1: an untagged DM message is kept only in the user's default Space,
 // no longer leaking into every Space.
