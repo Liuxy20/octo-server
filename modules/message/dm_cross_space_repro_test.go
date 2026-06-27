@@ -168,6 +168,7 @@ func reproSetup(t *testing.T) (*server.Server, *config.Context) {
 	reproSeedSpace(t, ctx, reproSpaceDefault, "2020-01-01 00:00:00")
 	reproSeedSpace(t, ctx, reproSpaceB, "2021-01-01 00:00:00")
 	reproSeedSpace(t, ctx, reproSpaceC, "2022-01-01 00:00:00")
+	reproEnsureAppBotTable(t, ctx)
 
 	r := ctx.GetRedisConn()
 	_ = r.Del("ratelimit:uid:" + testutil.UID)
@@ -178,19 +179,20 @@ func reproSetup(t *testing.T) (*server.Server, *config.Context) {
 	return s, ctx
 }
 
-// reproIngestDM drives the REAL WuKongIM message webhook for an inbound DM
-// (peer → login user) tagged with spaceID, populating dm_space_presence. The
-// HMAC signature satisfies verifyRequestSignature. Payload is a []byte JSON
-// field → base64-encoded on the wire (encoding/json round-trips []byte).
-func reproIngestDM(t *testing.T, s *server.Server, spaceID string, seq uint32) {
+// reproIngestPersonMsg drives the REAL WuKongIM message webhook for an inbound
+// Person message (fromUID → channelID) tagged with spaceID, populating
+// dm_space_presence. The HMAC signature satisfies verifyRequestSignature.
+// Payload is a []byte JSON field → base64-encoded on the wire (encoding/json
+// round-trips []byte). The webhook keys presence by
+// common.GetFakeChannelIDWith(fromUID, channelID), which is symmetric — so it
+// matches the conversation read side GetFakeChannelIDWith(loginUID, peer).
+func reproIngestPersonMsg(t *testing.T, s *server.Server, fromUID, channelID, spaceID string, seq uint32) {
 	t.Helper()
 	payload := fmt.Sprintf(`{"type":1,"content":"m%d","space_id":%q}`, seq, spaceID)
 	b64 := base64.StdEncoding.EncodeToString([]byte(payload))
-	// from_uid = peer, channel_id = login user → GetFakeChannelIDWith canonical
-	// pair matches the conversation read side GetFakeChannelIDWith(loginUID, peer).
 	body := fmt.Sprintf(
 		`[{"message_id":%d,"message_seq":%d,"from_uid":%q,"channel_id":%q,"channel_type":1,"timestamp":%d,"payload":%q}]`,
-		seq, seq, reproPeerUID, testutil.UID, 1700000000+int(seq), b64,
+		seq, seq, fromUID, channelID, 1700000000+int(seq), b64,
 	)
 	mac := hmac.New(sha256.New, []byte(reproWebhookSecret))
 	mac.Write([]byte(body))
@@ -201,6 +203,51 @@ func reproIngestDM(t *testing.T, s *server.Server, spaceID string, seq uint32) {
 	req.Header.Set("X-Signature-256", sig)
 	s.GetRoute().ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+}
+
+// reproIngestDM ingests an inbound DM from the peer contact to the login user.
+func reproIngestDM(t *testing.T, s *server.Server, spaceID string, seq uint32) {
+	t.Helper()
+	reproIngestPersonMsg(t, s, reproPeerUID, testutil.UID, spaceID, seq)
+}
+
+// reproSeedBotUser marks botUID as a regular bot (user.robot=1) so GetBotUIDs
+// recognizes it and the conversation filter routes it through the bot branch.
+func reproSeedBotUser(t *testing.T, ctx *config.Context, botUID string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, robot) VALUES (?, 1)", botUID,
+	).Exec()
+	require.NoError(t, err)
+}
+
+// reproEnsureAppBotTable stubs an EMPTY app_bot table. The bot in these tests is
+// a robot (user.robot=1, identified by GetBotUIDs); app_bot is a SEPARATE
+// mechanism (platform/space-scoped bots) and is left empty here. But
+// CheckBotsInSpace (pkg/space) always also queries app_bot — and the message test
+// binary doesn't load the app_bot module, so that table is absent and the query
+// errors → resolveBotFilter fail-opens (skipBotFilter=true) and shows every bot in
+// every Space, masking the membership logic. Creating the empty table lets the
+// robot membership path (space_member) run for real. Only the queried columns are
+// needed (uid/status/scope/space_id); nothing inserts into it here.
+func reproEnsureAppBotTable(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"CREATE TABLE IF NOT EXISTS app_bot (" +
+			"uid VARCHAR(40) NOT NULL, status TINYINT NOT NULL DEFAULT 0, " +
+			"scope VARCHAR(20) NOT NULL DEFAULT 'platform', space_id VARCHAR(40) DEFAULT NULL)",
+	).Exec()
+	require.NoError(t, err)
+}
+
+// reproSeedBotMember makes botUID a member of spaceID (CheckBotsInSpace → in-space).
+func reproSeedBotMember(t *testing.T, ctx *config.Context, spaceID, botUID string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+		spaceID, botUID,
+	).Exec()
+	require.NoError(t, err)
 }
 
 // reproCallConvSync drives POST /v1/conversation/sync with X-Space-ID and
@@ -357,4 +404,62 @@ func TestRepro484_Symptom1_UntaggedHistoryOnlyInDefaultSpace(t *testing.T) {
 	inDefault := reproCallChannelSync(t, s, reproSpaceDefault)
 	assert.True(t, reproContains(inDefault, "msg-UNTAGGED"), "untagged msg retained in default Space")
 	assert.False(t, reproContains(inDefault, "msg-tagged-B"), "default Space does NOT see spaceB's tagged msg")
+}
+
+// TestRepro484_Bot_SystemBotVisibleInEverySpace locks the contract that a system
+// bot DM (here botfather) is present in the conversation list of EVERY Space —
+// the #484 fix must not change this. Visibility holds via the SystemBots branch
+// in decideConvKeepInSpace (space_filter.go) and/or the EnsureSystemBotsPresent
+// fallback injection.
+func TestRepro484_Bot_SystemBotVisibleInEverySpace(t *testing.T) {
+	s, _ := reproSetup(t)
+	// botfather DM with a spaceB-tagged recent — irrelevant to a system bot, which
+	// is visible regardless of Space/messages.
+	reproIMConv = &config.SyncUserConversationResp{
+		ChannelID:   "botfather",
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Timestamp:   1700000099,
+		LastMsgSeq:  1,
+		Version:     100,
+		Recents:     []*config.MessageResp{reproMsg(1, "bot-hi", reproSpaceB)},
+	}
+
+	inDefault := reproCallConvSync(t, s, reproSpaceDefault)
+	inC := reproCallConvSync(t, s, reproSpaceC)
+
+	assert.True(t, reproContains(inDefault, "botfather"), "system bot visible in default Space")
+	assert.True(t, reproContains(inC, "botfather"), "system bot visible in non-default spaceC too")
+}
+
+// TestRepro484_Bot_RegularBotRespectsSpaceMembership verifies a regular bot
+// (user.robot=1) is visible only in Spaces it is a member of — and crucially that
+// its dm_space_presence row (written by the webhook for ANY Person message with a
+// space_id, bots included) is IGNORED: the presence/Recents check is gated behind
+// `if !botSet[channelID]`, so a bot that messaged in spaceC but is NOT a spaceC
+// member must stay hidden there. This locks the !botSet gate (space_filter.go:321).
+func TestRepro484_Bot_RegularBotRespectsSpaceMembership(t *testing.T) {
+	s, ctx := reproSetup(t)
+	const botX = "bot_x_888"
+	reproSeedBotUser(t, ctx, botX)                // recognized as a bot
+	reproSeedBotMember(t, ctx, reproSpaceB, botX) // member of spaceB only
+
+	// The bot sent a spaceC-tagged message → webhook writes presence(pair, spaceC).
+	// The bot is NOT a spaceC member, so this row must NOT make it visible there.
+	reproIngestPersonMsg(t, s, botX, testutil.UID, reproSpaceC, 1)
+
+	reproIMConv = &config.SyncUserConversationResp{
+		ChannelID:   botX,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Timestamp:   1700000099,
+		LastMsgSeq:  1,
+		Version:     100,
+		Recents:     []*config.MessageResp{reproMsg(1, "bot-msg", reproSpaceC)},
+	}
+
+	inB := reproCallConvSync(t, s, reproSpaceB)
+	inC := reproCallConvSync(t, s, reproSpaceC)
+
+	assert.True(t, reproContains(inB, botX), "regular bot visible in spaceB (it is a member)")
+	assert.False(t, reproContains(inC, botX),
+		"regular bot HIDDEN in spaceC: not a member, and its dm_space_presence row is correctly ignored for bots")
 }
