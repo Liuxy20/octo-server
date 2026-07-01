@@ -62,10 +62,11 @@ const (
 // handlers hit, off mutable response vars. Tests run sequentially (no
 // t.Parallel), so the shared vars need no lock.
 var (
-	reproIMOnce sync.Once
-	reproIMSrv  *httptest.Server
-	reproIMConv *config.SyncUserConversationResp // /conversation/sync payload (single DM)
-	reproIMMsgs []*config.MessageResp            // /channel/messagesync payload
+	reproIMOnce  sync.Once
+	reproIMSrv   *httptest.Server
+	reproIMConv  *config.SyncUserConversationResp   // /conversation/sync payload (single DM)
+	reproIMConvs []*config.SyncUserConversationResp // /conversation/sync payload (multi-DM); takes precedence over reproIMConv
+	reproIMMsgs  []*config.MessageResp              // /channel/messagesync payload
 )
 
 func reproFakeIM() *httptest.Server {
@@ -75,7 +76,10 @@ func reproFakeIM() *httptest.Server {
 			switch {
 			case strings.HasSuffix(r.URL.Path, "/conversation/sync"):
 				convs := []*config.SyncUserConversationResp{}
-				if reproIMConv != nil {
+				switch {
+				case reproIMConvs != nil:
+					convs = reproIMConvs
+				case reproIMConv != nil:
 					convs = append(convs, reproIMConv)
 				}
 				_, _ = w.Write([]byte(util.ToJson(convs)))
@@ -129,6 +133,38 @@ func reproDMConv() *config.SyncUserConversationResp {
 	}
 }
 
+// reproMsgFor is reproMsg for an arbitrary peer (multi-DM scenarios).
+func reproMsgFor(peer string, seq uint32, content, spaceID string) *config.MessageResp {
+	payload := map[string]interface{}{"type": 1, "content": content}
+	if spaceID != "" {
+		payload["space_id"] = spaceID
+	}
+	return &config.MessageResp{
+		MessageID:   int64(seq),
+		MessageSeq:  seq,
+		ClientMsgNo: content,
+		FromUID:     peer,
+		ChannelID:   peer,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Timestamp:   1700000000 + int32(seq),
+		Payload:     []byte(util.ToJson(payload)),
+	}
+}
+
+// reproDMConvFor builds a DM conversation for `peer` whose single recent message
+// is tagged with `spaceID` (or untagged when spaceID==""). Used to assemble a
+// multi-DM /conversation/sync payload mirroring the production snapshot.
+func reproDMConvFor(peer, content, spaceID string) *config.SyncUserConversationResp {
+	return &config.SyncUserConversationResp{
+		ChannelID:   peer,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Timestamp:   1700000099,
+		LastMsgSeq:  1,
+		Version:     100,
+		Recents:     []*config.MessageResp{reproMsgFor(peer, 1, content, spaceID)},
+	}
+}
+
 func reproSeedSpace(t *testing.T, ctx *config.Context, spaceID, createdAt string) {
 	t.Helper()
 	_, err := ctx.DB().InsertBySql(
@@ -143,11 +179,65 @@ func reproSeedSpace(t *testing.T, ctx *config.Context, spaceID, createdAt string
 	require.NoError(t, err)
 }
 
+// reproSeedGroup inserts a row into `group` with the given space_id. An empty
+// spaceID models a spaceless group whose Space cannot be resolved, so the
+// server's group filter fails open.
+func reproSeedGroup(t *testing.T, ctx *config.Context, groupNo, spaceID string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no, name, status, space_id) VALUES (?, ?, 1, ?)",
+		groupNo, groupNo, spaceID,
+	).Exec()
+	require.NoError(t, err)
+}
+
+// reproSeedGroupMember makes the login user an active member of groupNo.
+// conversation/sync gates group conversations behind ExistMembers
+// (api_conversation.go:474), so a group is dropped entirely unless the caller is
+// a member — orthogonal to the Space filter under test.
+func reproSeedGroupMember(t *testing.T, ctx *config.Context, groupNo string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO group_member (group_no, uid, role, status, is_deleted, version) VALUES (?, ?, 0, 1, 0, 1)",
+		groupNo, testutil.UID,
+	).Exec()
+	require.NoError(t, err)
+}
+
+// reproGroupConv builds a GROUP conversation (bare group_no, conv-level SpaceID
+// empty) as IMSyncUserConversation returns it; the server resolves its Space from
+// the `group` table (GetGroups → groupSpaceMap).
+func reproGroupConv(groupNo, content string) *config.SyncUserConversationResp {
+	return &config.SyncUserConversationResp{
+		ChannelID:   groupNo,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		Timestamp:   1700000099,
+		LastMsgSeq:  1,
+		Version:     100,
+		Recents: []*config.MessageResp{{
+			MessageID:   1,
+			MessageSeq:  1,
+			ClientMsgNo: content,
+			FromUID:     testutil.UID,
+			ChannelID:   groupNo,
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+			Timestamp:   1700000001,
+			Payload:     []byte(util.ToJson(map[string]interface{}{"type": 1, "content": content})),
+		}},
+	}
+}
+
 // reproSetup wires a fresh test server with the fake IM, seeds the three Space
 // memberships, configures the webhook HMAC secret, and clears Redis state so
 // each test is deterministic.
 func reproSetup(t *testing.T) (*server.Server, *config.Context) {
 	t.Helper()
+
+	// Reset the shared fake-IM response vars so each test is independent
+	// regardless of run order (single-conv and multi-conv tests share these).
+	reproIMConv = nil
+	reproIMConvs = nil
+	reproIMMsgs = nil
 
 	// module.Setup (common module) refuses to start without a master key.
 	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
@@ -258,7 +348,11 @@ func reproCallConvSync(t *testing.T, s *server.Server, spaceID string) []string 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/v1/conversation/sync", strings.NewReader(body))
 	req.Header.Set("token", testutil.Token)
-	req.Header.Set("X-Space-ID", spaceID)
+	// spaceID=="" models a request with NO space context (no X-Space-ID, no
+	// ?space_id) — SpaceMiddleware then passes through without setting space_id.
+	if spaceID != "" {
+		req.Header.Set("X-Space-ID", spaceID)
+	}
 	s.GetRoute().ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
@@ -273,6 +367,14 @@ func reproCallConvSync(t *testing.T, s *server.Server, spaceID string) []string 
 		ids = append(ids, c.ChannelID)
 	}
 	return ids
+}
+
+// reproCallConvSyncNoSpace drives POST /v1/conversation/sync with NO space
+// context at all (no ?space_id, no X-Space-ID) — the production "client forgot
+// to send space_id" request. The handler then SKIPS FilterConversationsBySpace.
+func reproCallConvSyncNoSpace(t *testing.T, s *server.Server) []string {
+	t.Helper()
+	return reproCallConvSync(t, s, "")
 }
 
 // reproCallChannelSync drives POST /v1/message/channel/sync for the DM channel
