@@ -4,6 +4,19 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-02
+
+- **Remove** — Task `incoming-webhook-remove-name-prefix`: dropped the
+  server-enforced `Webhook-` name prefix that was force-prepended to
+  non-admin (member/bot) submitted incoming-webhook display names
+  (originally added anti-impersonation, PR #340 review). Members can now
+  set any name, same as admins. Kept: avatar lock for non-admins, default
+  auto-naming (`Webhook-xxxxxx`) when no name is submitted, and the
+  push-time `Username`/`AvatarURL` override block for non-admin webhooks
+  (separate control, unaffected). Paired frontend change in octo-web
+  removed the now-stale hint text. Brief under
+  `.octospec/tasks/incoming-webhook-remove-name-prefix/`.
+
 ## 2026-06-29
 
 - **Change** — Task `group-avatar-name-no-text` (client-coordination; repurposes
