@@ -31,8 +31,15 @@ func FilterConversationsBySpace(
 		return conversations
 	}
 
-	// 查用户的默认 Space（最早加入的），裸 UID 旧会话只在默认 Space 显示
-	defaultSpaceID := space.GetUserDefaultSpaceID(ctx, loginUID)
+	// 查用户的默认 Space（最早加入的），裸 UID 旧会话只在默认 Space 显示。
+	// defaultSpaceID 现在同时决定空 space_id 群/子区的归属（只在默认 Space 露出），
+	// 查询失败时按兼容口径 fail-open（视 filterSpaceID 为默认）：本次请求内空
+	// space_id 群可见、catch-all 生效，不因一次 DB 抖动隐藏更多内容。
+	defaultSpaceID, defaultSpaceErr := space.GetUserDefaultSpaceIDE(ctx, loginUID)
+	if defaultSpaceErr != nil {
+		log.Warn("查询默认 Space 失败，Space 过滤按兼容口径 fail-open", zap.Error(defaultSpaceErr), zap.String("loginUID", loginUID))
+		defaultSpaceID = filterSpaceID
+	}
 
 	// 群聊的 channel_id 是裸 group_no（没有 Space 前缀），ParseChannelID 返回 spaceID=""。
 	// 需要从 group 表查出真实 space_id。
@@ -100,7 +107,22 @@ func FilterConversationsBySpace(
 		loginUID, groupService,
 	)
 
-	return filterConversationsCore(conversations, filterSpaceID, defaultSpaceID, groupSpaceMap, externalGroupMap, botSet, botInSpace, skipGroupFilter, skipBotFilter)
+	filtered := filterConversationsCore(conversations, filterSpaceID, defaultSpaceID, groupSpaceMap, externalGroupMap, botSet, botInSpace, skipGroupFilter, skipBotFilter)
+
+	// issue #484 follow-up：默认 Space catch-all 收紧。仅在默认 Space 请求、且
+	// 默认 Space 解析成功时启用；presence 证据表明 DM 只属于其他 Space 且 Recents
+	// 无反证 → 隐藏。任何查询失败降级为不隐藏（见 space_filter_default_catchall.go）。
+	if filterSpaceID == defaultSpaceID && defaultSpaceErr == nil {
+		elsewhereOnly := resolveDMElsewhereOnly(ctx, loginUID, defaultSpaceID, bareDMUIDs)
+		filtered = hideElsewhereOnlyDMsInDefaultSpace(
+			filtered,
+			func(c *SyncUserConversationResp) string { return c.ChannelID },
+			func(c *SyncUserConversationResp) uint8 { return c.ChannelType },
+			func(c *SyncUserConversationResp) bool { return personConvAllRecentsTaggedElsewhere(c, defaultSpaceID) },
+			elsewhereOnly, botSet, skipBotFilter,
+		)
+	}
+	return filtered
 }
 
 // filterThreadConvsByParentMembership 剔除“调用者已不是父群成员”的子区(CommunityTopic)
@@ -216,10 +238,10 @@ func filterConversationsCore(
 //     有 payload.space_id == targetSpaceID 的消息。
 //   - failClosedOnUnknownGroupSpace: 当 skipGroupFilter=true（group service 查询
 //     失败、无法确认群的 space_id）时的语义切换。
-//     - false（v1 兼容默认）：保留群/子区，不让一次 DB 抖动影响存量行为。
-//     - true（v2 sidebar 用，PR #21 Round-6 P0-1）：drop 群/子区，避免跨 Space
-//       泄露（reviewer Jerry-Xin / yujiawei）。这是 fail-closed —— 用户多刷
-//       一次即可，但绝不让 Space A 的群在 Space B 请求里露出。
+//   - false（v1 兼容默认）：保留群/子区，不让一次 DB 抖动影响存量行为。
+//   - true（v2 sidebar 用，PR #21 Round-6 P0-1）：drop 群/子区，避免跨 Space
+//     泄露（reviewer Jerry-Xin / yujiawei）。这是 fail-closed —— 用户多刷
+//     一次即可，但绝不让 Space A 的群在 Space B 请求里露出。
 func decideConvKeepInSpace(
 	channelID string,
 	channelType uint8,
@@ -259,7 +281,12 @@ func decideConvKeepInSpace(
 			}
 		}
 		if spaceID == "" {
-			return true
+			// issue #484 follow-up：无法归属的群（group.space_id 为空 / group 表无
+			// 记录）不再全 Space 可见 —— 生产实证这是最近列表串空间的确定路径
+			// （客户端拿到 conv 级 space_id=null 只能 fail-open 渲染到每个 Space）。
+			// 归属到用户默认 Space，与 #337 裸 DM、#484 无标签 DM 历史同口径；
+			// 群表回填 space_id 后自动恢复精确归属。
+			return filterSpaceID == defaultSpaceID
 		}
 		return false
 	}
@@ -321,7 +348,9 @@ func filterThreadConvCore(
 			return true
 		}
 	}
-	return parentSpaceID == ""
+	// issue #484 follow-up：父群无法归属（space_id 为空/群表无记录）的子区与父群
+	// 同口径 —— 只在用户默认 Space 露出，不再全 Space 可见。
+	return parentSpaceID == "" && filterSpaceID == defaultSpaceID
 }
 
 // filterThreadConv 判断子区会话是否应在 filterSpaceID 中显示。
@@ -431,11 +460,11 @@ func newSystemBotPlaceholder(uid string) *SyncUserConversationResp {
 //   - GROUP channel_id 本身做 Space 隔离（不同 Space 的群 channel_id 不同），
 //     对历史消息再过滤反而会误杀老群，因此 GROUP/COMMUNITY_TOPIC 路径不走这里。
 //   - 规则（与 Android ChatActivity.filterSystemBotMessages 口径对齐）：
-//       1) payload.space_id == spaceID               → 保留（精确匹配当前 Space）
-//       2) payload.space_id == "" && !isSystemBot    → 保留（老 DM 消息向前兼容）
-//       3) payload.space_id == "" &&  isSystemBot    → 丢弃（SystemBot 无 space
-//          标签的老消息默认隐藏，避免 fileHelper/u_10000 老消息跨 Space 泄露）
-//       4) payload.space_id != "" && != spaceID      → 丢弃（跨 Space 明确污染）
+//     1) payload.space_id == spaceID               → 保留（精确匹配当前 Space）
+//     2) payload.space_id == "" && !isSystemBot    → 保留（老 DM 消息向前兼容）
+//     3) payload.space_id == "" &&  isSystemBot    → 丢弃（SystemBot 无 space
+//     标签的老消息默认隐藏，避免 fileHelper/u_10000 老消息跨 Space 泄露）
+//     4) payload.space_id != "" && != spaceID      → 丢弃（跨 Space 明确污染）
 //
 // 调用方需保证 spaceID != ""（空串视为未启用 Space 过滤，直接返回原列表），
 // 并只对 ChannelTypePerson 调用本函数。
@@ -626,7 +655,13 @@ func FilterRawConversationsBySpace(
 		return conversations
 	}
 
-	defaultSpaceID := space.GetUserDefaultSpaceID(ctx, loginUID)
+	// 同 v1：defaultSpaceID 决定空 space_id 群/子区归属与 DM catch-all，失败时
+	// fail-open（视 filterSpaceID 为默认），不因 DB 抖动隐藏更多内容。
+	defaultSpaceID, defaultSpaceErr := space.GetUserDefaultSpaceIDE(ctx, loginUID)
+	if defaultSpaceErr != nil {
+		log.Warn("v2 sidebar: 查询默认 Space 失败，Space 过滤按兼容口径 fail-open", zap.Error(defaultSpaceErr), zap.String("loginUID", loginUID))
+		defaultSpaceID = filterSpaceID
+	}
 
 	groupNoSeen := make(map[string]struct{})
 	var bareGroupNos []string
@@ -696,6 +731,21 @@ func FilterRawConversationsBySpace(
 		if keep {
 			filtered = append(filtered, conv)
 		}
+	}
+
+	// issue #484 follow-up：默认 Space catch-all 收紧（与 v1 同口径，见
+	// space_filter_default_catchall.go）。
+	if filterSpaceID == defaultSpaceID && defaultSpaceErr == nil {
+		elsewhereOnly := resolveDMElsewhereOnly(ctx, loginUID, defaultSpaceID, bareDMUIDs)
+		filtered = hideElsewhereOnlyDMsInDefaultSpace(
+			filtered,
+			func(c *config.SyncUserConversationResp) string { return c.ChannelID },
+			func(c *config.SyncUserConversationResp) uint8 { return c.ChannelType },
+			func(c *config.SyncUserConversationResp) bool {
+				return rawConvAllRecentsTaggedElsewhere(c, defaultSpaceID)
+			},
+			elsewhereOnly, botSet, skipBotFilter,
+		)
 	}
 	return filtered
 }

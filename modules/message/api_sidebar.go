@@ -824,13 +824,19 @@ func extractGroupNos(convs []*config.SyncUserConversationResp) []string {
 // 前显式按父群 space_id 过滤，规则与 FilterRawConversationsBySpace 的 group 分支一致：
 //   - 内部群：parent.space_id == spaceID 才保留
 //   - 外部群：当前 user 作为外部成员加入该群且 sourceSpaceID == spaceID 才保留
-//   - 旧群 (parent.space_id == "")：保留（沿用历史"所有 Space 可见"语义）
+//   - 旧群 (parent.space_id == "")：只在用户默认 Space 保留（issue #484 follow-up，
+//     与 filterThreadConvCore 同口径；此前"所有 Space 可见"是串空间路径）
 //
-// fail-closed：群表查询失败时返回 error，调用方 follow tab 整体退避，避免半结果泄露。
+// fail-closed：群表 / 默认 Space 查询失败时返回 error，调用方 follow tab 整体退避，
+// 避免半结果泄露。
 func (sb *Sidebar) filterThreadExtsBySpace(rows []*convext.Model, spaceID, loginUID string) ([]*convext.Model, error) {
 	parentNos := uniqueThreadParentGroupNos(rows)
 	if len(parentNos) == 0 {
 		return rows, nil
+	}
+	defaultSpaceID, err := space.GetUserDefaultSpaceIDE(sb.ctx, loginUID)
+	if err != nil {
+		return nil, fmt.Errorf("filter thread ext by space: default space: %w", err)
 	}
 	groupInfos, err := sb.groupService.GetGroups(parentNos)
 	if err != nil {
@@ -858,8 +864,11 @@ func (sb *Sidebar) filterThreadExtsBySpace(rows []*convext.Model, spaceID, login
 			continue
 		}
 		if parentSpaceID == "" {
-			// Legacy group without space_id: keep (mirrors v1 visibility).
-			kept = append(kept, ext)
+			// issue #484 follow-up：空 space_id 父群只在默认 Space 露出（与
+			// filterThreadConvCore 同口径），不再全 Space 可见。
+			if spaceID == defaultSpaceID {
+				kept = append(kept, ext)
+			}
 			continue
 		}
 		if parentSpaceID == spaceID {

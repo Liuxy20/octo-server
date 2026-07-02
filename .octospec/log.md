@@ -4,6 +4,21 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-02
+
+- **Change** — Task `conv-space-catchall-484` (issue #484 follow-up): closed the
+  two deterministically reproducible cross-Space paths in the recent-conversation
+  list. (1) The default-Space DM catch-all no longer lists a bare DM whose
+  `dm_space_presence` rows point exclusively at other Spaces (positive-evidence
+  post-pass; legacy no-presence DMs keep the catch-all; system bots exempt; any
+  query failure disables the pass). (2) Groups with empty `group.space_id` — and
+  their topics, in the conv filter AND sidebar thread-ext filter — now show only
+  in the user's default Space instead of every Space (same policy as #337 bare
+  DMs / #484 untagged history). Presence infra re-introduced byte-identical to
+  the unmerged `fix/dm-space-isolation-484` branch (user decision: pure-main
+  base) so the eventual merge dedupes. Journal:
+  `journal/shared/conv-space-catchall-484.md`.
+
 ## 2026-06-29
 
 - **Change** — Task `group-avatar-name-no-text` (client-coordination; repurposes

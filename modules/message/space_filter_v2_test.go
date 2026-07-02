@@ -35,14 +35,23 @@ func TestDecideConvKeepInSpace_Group_SpaceMismatch_Excluded(t *testing.T) {
 	assert.False(t, keep, "group in spaceA must NOT leak into spaceB sidebar request")
 }
 
-func TestDecideConvKeepInSpace_Group_LegacyNoSpace_VisibleEverywhere(t *testing.T) {
-	keep := decideConvKeepInSpace(
+func TestDecideConvKeepInSpace_Group_LegacyNoSpace_DefaultSpaceOnly(t *testing.T) {
+	// issue #484 follow-up：无法归属的群只在默认 Space 露出，不再全 Space 可见。
+	keepNonDefault := decideConvKeepInSpace(
 		"old-grp", common.ChannelTypeGroup.Uint8(), "",
 		"spaceB", "spaceA",
 		map[string]string{}, nil,
 		nil, nil, false, false, false, nil,
 	)
-	assert.True(t, keep, "legacy group without space_id stays visible everywhere")
+	assert.False(t, keepNonDefault, "legacy group without space_id must NOT show in a non-default Space")
+
+	keepDefault := decideConvKeepInSpace(
+		"old-grp", common.ChannelTypeGroup.Uint8(), "",
+		"spaceA", "spaceA",
+		map[string]string{}, nil,
+		nil, nil, false, false, false, nil,
+	)
+	assert.True(t, keepDefault, "legacy group without space_id stays visible in the default Space")
 }
 
 func TestDecideConvKeepInSpace_Group_ExternalSourceSpace(t *testing.T) {

@@ -276,14 +276,15 @@ func TestFilterConversationsBySpace_ThreadChannelExternalFallback(t *testing.T) 
 }
 
 func TestFilterConversationsBySpace_ThreadChannelLegacyParent(t *testing.T) {
-	// 父群无 space_id（旧群） → 子区跟旧群一样所有 Space 可见
+	// issue #484 follow-up：父群无 space_id（旧群）的子区不再全 Space 可见，
+	// 只在用户默认 Space 露出（与旧群本体同口径）。
 	convs := []*SyncUserConversationResp{
 		{ChannelID: "gLegacy____123456789012345", ChannelType: common.ChannelTypeCommunityTopic.Uint8(), SpaceID: ""},
 	}
 	result := filterConversationsCore(convs, "spaceA", "spaceDefault", map[string]string{}, nil, nil, nil, false, false)
-	assert.Len(t, result, 1)
-	result = filterConversationsCore(convs, "spaceB", "spaceDefault", map[string]string{}, nil, nil, nil, false, false)
-	assert.Len(t, result, 1)
+	assert.Len(t, result, 0, "非默认 Space 不显示旧父群的子区")
+	result = filterConversationsCore(convs, "spaceDefault", "spaceDefault", map[string]string{}, nil, nil, nil, false, false)
+	assert.Len(t, result, 1, "默认 Space 保留旧父群的子区")
 }
 
 func TestFilterConversationsBySpace_ThreadChannelInvalidID(t *testing.T) {
