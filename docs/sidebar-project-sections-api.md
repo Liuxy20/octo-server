@@ -161,8 +161,9 @@ HTTP `200`，响应体为数组，不额外包裹 `data`：
 - 用户显式取消置顶后，该 Project 从关注移除，即使用户仍是 Project 成员。
 - 再次置顶会恢复该 Project，保留此前的顶层排序位置。
 - 已退出、已解散或不再可见的 Project 不会返回。
-- Project 群只会出现在 Project 下，不会同时出现在手动分类中；`groups` 仅是
-  关联元数据，不授予原生群读写、子区或成员权限。
+- Project 群始终出现在其 Project 下，用户还可以把它放入自己的手动分类；两处
+  视图相互独立，取消其中一处不影响另一处；`groups` 仅是关联元数据，不授予原生群
+  读写、子区或成员权限。
 
 ## 4. 更新关注页顶层排序
 
@@ -313,7 +314,11 @@ interface SidebarItemProjectFields {
 ### `GET /v1/spaces/{space_id}/categories`
 
 响应结构不变，但分类顺序现在来自统一 Sidebar Sections 顺序。Project 条目不会出现在
-该接口中，Project 群也不会进入任何手动分类。
+该接口中；Project 群可以进入手动分类，与本接口的群组树形结构一视同仁。
+
+附加字段：`groups[]` 条目携带 `project_id`（`omitempty`，普通群省略）。同一 Project 群
+可能同时出现在其 Project 分区与手动分类两处，客户端可据此识别分类里的 Project 群并按需
+跨视图去重；服务端不做去重。
 
 ### `PUT /v1/spaces/{space_id}/categories/sort`
 
@@ -329,31 +334,20 @@ interface SidebarItemProjectFields {
 {"category_id": "category-001"}
 ```
 
-如果目标群属于 Project，非空 `category_id` 会被拒绝：
+Project 群与普通群一样允许移入或移出分类：成功返回 200。同一群会同时保留在其
+Project 条目的 `groups[]` 关联元数据与用户的手动分类视图（关注 tab）中；分类条目携带
+`project_id`，客户端按两个独立视图渲染，需要跨视图关联（例如去重）时可据此匹配。服务端
+不做去重。
 
-```json
-{
-  "error": {
-    "code": "err.server.category.project_group_cannot_categorize",
-    "message": "A Project group cannot be placed in a manual category.",
-    "details": {},
-    "http_status": 409
-  },
-  "msg": "A Project group cannot be placed in a manual category.",
-  "status": 400
-}
-```
-
-兼容期内 HTTP transport status 仍为 `400`；客户端应优先读取
-`error.code` 和 `error.http_status`。
-
-`{"category_id":""}` 表示移出分类。即使目标群属于 Project，该清理请求也允许，
-用于修复升级前遗留的异常分类关系。
+`{"category_id":""}` 表示移出分类。对普通群即"取消关注"（移出关注 tab）；对 Project
+群只是退出该用户的手动分类——它仍展示在其 Project 条目的 `groups[]` 里，但（与普通群同
+语义）移出分类会同步停止该群新子区的自动关注物化（auto_follow_threads 清 0），需要时
+重新移入分类即可恢复。
 
 ### `POST /v1/group/create`
 
-`project_id` 与 `category_id` 互斥。两者同时为非空时请求返回
-`err.server.group.request_invalid`，不会创建群或写入分类关系。
+`project_id` 与 `category_id` 可以同时携带：群挂到指定 Project，同时按普通群同口径把
+category_id 落到创建者的 `group_setting`（best-effort，失败不阻断建群）。
 
 ## 8. Sidebar Sections 错误码
 
