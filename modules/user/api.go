@@ -50,6 +50,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/obo"
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -121,6 +122,8 @@ type User struct {
 	tokenValidator           *auth.TokenValidator
 	scanLoginAuthorizations  *scanLoginAuthorizationStore
 	revocationWorkerOwner    string
+	oboRegistry              *obo.ActionRegistry
+	oboReader                obo.SnapshotReader
 }
 
 type userSessionStore interface {
@@ -156,6 +159,10 @@ type currentUserTokenInvalidator interface {
 // New New
 func New(ctx *config.Context) *User {
 	sessionStore, loginRedisClient := auth.SessionStoreAndClientForContext(ctx)
+	oboRegistry, err := obo.ParseActionRegistry(os.Getenv("OCTO_OBO_ACTION_SCOPES_JSON"))
+	if err != nil {
+		panic(err) // Invalid Action policy must fail at startup.
+	}
 	u := &User{
 		ctx:                      ctx,
 		db:                       NewDB(ctx),
@@ -190,6 +197,8 @@ func New(ctx *config.Context) *User {
 		tokenValidator:           auth.NewTokenValidator(sessionStore, ctx.GetConfig().Cache.TokenCachePrefix),
 		scanLoginAuthorizations:  newScanLoginAuthorizationStore(loginRedisClient),
 		revocationWorkerOwner:    util.GenerUUID(),
+		oboRegistry:              oboRegistry,
+		oboReader:                obo.DBSnapshotReader{Session: ctx.DB()},
 	}
 	// LanguageService 与 main.go 注入到 CacheTokenParser 的实例独立构造，但共享
 	// 底层 *DB session / Redis 连接，因此读写同一份 user.language 列与
@@ -239,9 +248,10 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 	// tag 用稳定字符串分离 keyspace；注意 register 和 sms 参数相同但语义不同，必须分开
 	loginLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "login", 10.0/60, 5)       // 10 req/min, burst 5
 	verifyLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "verify", 1000.0/60, 100) // 1000 req/min, burst 100 (Gateway traffic)
-	registerLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "register", 5.0/60, 3)  // 5 req/min, burst 3
-	smsLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "sms", 5.0/60, 3)            // 5 req/min, burst 3
-	searchLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "search", 30.0/60, 15)    // 30 req/min, burst 15
+	resolveLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "resolve", 1000.0/60, 100)
+	registerLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "register", 5.0/60, 3) // 5 req/min, burst 3
+	smsLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "sms", 5.0/60, 3)           // 5 req/min, burst 3
+	searchLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "search", 30.0/60, 15)   // 30 req/min, burst 15
 	// 扫码登录的两个端点此前既未认证也未限流：loginuuid 可被用来批量铸造钓鱼二维码，
 	// loginstatus 每次请求挂起 10 秒、可用来占满连接与 goroutine。
 	//
@@ -403,6 +413,7 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		// #################### Token / Bot 认证验证（供 Gateway 调用） ####################
 		v.POST("/auth/verify", verifyLimit, u.authVerifyToken)          // 验证用户 token
 		v.POST("/auth/verify-bot", verifyLimit, u.authVerifyBot)        // 验证 Bot API Key
+		v.POST("/auth/resolve", resolveLimit, u.authResolveBot)         // Resolve Bot identity and OBO delegation.
 		v.POST("/auth/verify-api-key", verifyLimit, u.authVerifyAPIKey) // 验证 daemon API Key (uk_)
 		// ↑ Verify endpoints are rate-limited (1000 req/min/IP). For production,
 		// restrict access at network level (nginx allow internal IPs only) or
@@ -5152,7 +5163,7 @@ func (u *User) authVerifyBot(c *wkhttp.Context) {
 	}
 	err := u.db.session.Select("robot_id", "IFNULL(creator_uid,'') as creator_uid").
 		From("robot").
-		Where("bot_token = ? AND bot_token != '' AND status = 1", req.BotToken).
+		Where("bot_token = ? AND BINARY bot_token = BINARY ? AND bot_token != '' AND status = 1", req.BotToken, req.BotToken).
 		LoadOne(&botInfo)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "invalid bot token"})

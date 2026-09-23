@@ -117,7 +117,7 @@ func TestOBO_BotGetGrant_NoGrant(t *testing.T) {
 // TestOBO_BotGetGrant_RevokedGrant — the 404 path must also cover
 // grants that exist but have been revoked. `revokeGrant` flips
 // active=0 / global_enabled=0 / sets revoked_at, and our
-// findActiveGrantByBot SELECT filters on `active=1`, so the row must
+// findActiveGrantByBot SELECT filters to usable Grants, so the row must
 // not surface.
 func TestOBO_BotGetGrant_RevokedGrant(t *testing.T) {
 	const (

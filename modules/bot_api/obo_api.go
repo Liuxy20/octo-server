@@ -32,6 +32,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
 )
 
@@ -108,6 +109,8 @@ func (ba *BotAPI) registerOBORoutes(r *wkhttp.WKHttp) {
 		return
 	}
 	auth := r.Group("/v1/obo", ba.ctx.AuthMiddleware(r))
+	// Deprecated: Persona Grant/Channel Scope management remains available
+	// during migration, but new callers must use the policy endpoints below.
 	auth.POST("/grants", ba.oboCreateGrant)
 	auth.GET("/grants", ba.oboListGrants)
 	auth.DELETE("/grants/:id", ba.oboDeleteGrant)
@@ -115,6 +118,13 @@ func (ba *BotAPI) registerOBORoutes(r *wkhttp.WKHttp) {
 	auth.POST("/scopes", ba.oboCreateScope)
 	auth.DELETE("/scopes/:id", ba.oboDeleteScope)
 	auth.GET("/grants/:id/scopes", ba.oboListScopes)
+	// New generic policy write: Human identity and per-UID throttle are required.
+	auth.PUT("/delegations/:bot_uid", appwkhttp.SharedUIDRateLimiter(r, ba.ctx), ba.oboPutDelegation)
+	auth.GET("/grants/:id", appwkhttp.SharedUIDRateLimiter(r, ba.ctx), ba.oboGetGenericGrant)
+	auth.GET("/grants/:id/scope-bindings", appwkhttp.SharedUIDRateLimiter(r, ba.ctx), ba.oboListGenericBindings)
+	auth.POST("/grants/:id/scope-bindings", appwkhttp.SharedUIDRateLimiter(r, ba.ctx), ba.oboBindGenericScope)
+	auth.DELETE("/grants/:id/scope-bindings/ALL", appwkhttp.SharedUIDRateLimiter(r, ba.ctx), ba.oboUnbindGenericScope)
+	auth.GET("/grants/:id/audits", appwkhttp.SharedUIDRateLimiter(r, ba.ctx), ba.oboListPolicyAudits)
 }
 
 // ==================== Request DTOs ====================
@@ -628,9 +638,9 @@ type oboBotGetGrantResp struct {
 //     on authenticated requests; the defensive empty-uid branch
 //     below 500s because reaching it means the middleware broke
 //     its invariant and a 401 would mask that).
-//   - 404 — no active grant for this bot. Note: "no active grant"
+//   - 404 — no usable grant for this bot. Note: "no usable grant"
 //     covers both "grant never existed" and "grant was paused
-//     or revoked"; the adapter should treat 404 as "do not
+//     or revoked or expired"; the adapter should treat 404 as "do not
 //     apply a persona" without distinguishing the cause.
 //   - 500 — store error.
 //
@@ -683,7 +693,7 @@ func (ba *BotAPI) requireOwnedGrant(c *wkhttp.Context, uid string, id int64) (*o
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return nil, err
 	}
-	if grant == nil {
+	if grant == nil || grant.Mode == policyGrantMode {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBOGrantNotFound, nil, nil)
 		return nil, nil
 	}

@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/obo"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
@@ -35,6 +36,7 @@ type Project struct {
 	// than reimplemented — see projectMemberCacheKey for why a second copy of that
 	// fact under a project: key would be an isolation hole.
 	spaceCache *spacepkg.RedisMembershipCache
+	oboReader  obo.SnapshotReader
 	// auditSink is nil in production (entries go to the structured log). Tests set it so
 	// the "every write path audits" contract is assertable without capturing the
 	// process-wide logger.
@@ -134,6 +136,7 @@ func New(ctx *config.Context) *Project {
 		// converges here within the reload interval without a restart.
 		settings: common.EnsureSystemSettings(ctx),
 	}
+	p.oboReader = obo.DBSnapshotReader{Session: p.db.session}
 	// nil-conn deployments (Redis-less mode) leave spaceCache nil so the middleware degrades
 	// to the database instead of dereferencing a nil redis.Conn. The other Redis paths already
 	// check GetRedisConn() per call.
@@ -204,6 +207,7 @@ func (p *Project) Route(r *wkhttp.WKHttp) {
 	// The census runs regardless, so a rollback that clears the target list does not take
 	// the gauges with it — see startProvisioningMetrics.
 	p.startProvisioningMetrics()
+	p.registerBotProjectRoutes(r)
 
 	spaceScoped := r.Group("/v1/space",
 		p.ctx.AuthMiddleware(r),
