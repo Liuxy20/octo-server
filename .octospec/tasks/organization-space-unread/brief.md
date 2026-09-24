@@ -50,5 +50,6 @@ Conversation sync already returns conversation unread counts and computes curren
 - An unread DM with an invalid payload, or an untagged unread DM without a default Space, omits the authoritative snapshot instead of silently under-counting it.
 - When DM Recents do not cover all unread messages, the organization-unread window follows pinned WuKongIM tag `v2.2.4-20260313` (revision `94b06a4694fa`): `PullModeDown=0`, `end <= start`, returning `(end, start]`. The separate message-preview fallback remains unchanged.
 - An incomplete baseline omits `space_unreads` so Web can retain its previous value.
+- A baseline that reaches the pinned WuKongIM `conversation.userMaxCount` is treated as potentially truncated and omits `space_unreads`.
 - Once the snapshot is known to be incomplete, filtered-out DMs do not trigger organization-only unread-window pulls that would be discarded.
 - Focused tests cover aggregation, serialization, mute behavior, and failure/omission behavior.

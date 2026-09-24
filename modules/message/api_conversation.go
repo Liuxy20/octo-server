@@ -432,6 +432,16 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
+	if wantSpaceUnreads && !hasCompleteSpaceUnreadConversationBaseline(len(conversations)) {
+		// WuKongIM returns only its most recent conversation.userMaxCount rows and
+		// exposes no truncation flag. Keep the normal conversation response, but do
+		// not publish a wipe-replace snapshot from an ambiguous capped baseline.
+		spaceUnreadsComplete = false
+		co.Warn("WuKongIM 最近会话达到上限，省略 space_unreads",
+			zap.String("loginUID", loginUID),
+			zap.Int("conversationCount", len(conversations)),
+		)
+	}
 	groupNos := make([]string, 0, len(conversations))
 	uids := make([]string, 0, len(conversations))
 	channelIDs := make([]string, 0, len(conversations))

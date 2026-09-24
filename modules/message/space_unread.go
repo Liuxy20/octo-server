@@ -12,6 +12,12 @@ import (
 	"go.uber.org/zap"
 )
 
+// pinnedWuKongIMConversationUserMaxCount mirrors conversation.userMaxCount in
+// the pinned/deployed WuKongIM v2.2.4-20260313 configuration. The sync response
+// has no truncation flag, so reaching this limit cannot be treated as complete.
+// Keep this value aligned if the deployment overrides that WuKongIM setting.
+const pinnedWuKongIMConversationUserMaxCount = 1000
+
 // resolvePersonPeerUID removes the optional Space prefix before looking up user or Bot metadata.
 // Keep this normalization local to conversation metadata and unread accounting. Message visibility,
 // system-Bot placeholders, and sidebar filtering have separate compatibility contracts.
@@ -348,6 +354,10 @@ func canBuildCompleteSpaceUnreadSnapshot(
 	messageSaveAcrossDevice bool,
 ) bool {
 	return include && version == 0 && msgCount > 0 && lastMsgSeqs == "" && messageSaveAcrossDevice
+}
+
+func hasCompleteSpaceUnreadConversationBaseline(conversationCount int) bool {
+	return conversationCount < pinnedWuKongIMConversationUserMaxCount
 }
 
 // dmMessageSpaceID 读取消息 payload 的 space_id（缺失 / 空 / 非字符串一律视为 ""，

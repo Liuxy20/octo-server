@@ -3,9 +3,9 @@
 - Rules checked: `space-isolation`, `error-handling`, `trust-boundary`, `rate-limit`, `testing`, `commit-style`.
 - Commands run:
   - `go test ./pkg/space -run 'Test(ActiveSpacesForMember|CheckMembershipEmptyArgs)$' -count=1` → passed.
-  - `go test -ldflags='-s -w' ./modules/message -run 'Test(CanBuildCompleteSpaceUnreadSnapshot|FillPersonSpaceUnreadAndCollect|AggregateConversationSpaceUnreads|SyncUserConversationRespWrap|CountSpaceUnread|CountSpaceUnreads)' -count=1` → passed.
-  - `go test -race -ldflags='-s -w' ./modules/message -run 'Test(CanBuildCompleteSpaceUnreadSnapshot|FillPersonSpaceUnreadAndCollect|AggregateConversationSpaceUnreads|SyncUserConversationRespWrap|CountSpaceUnread|CountSpaceUnreads)' -count=1` → passed.
-  - `go vet ./modules/message/...` → passed.
+  - `go test -ldflags='-s -w' ./modules/message -run 'Test(CanBuildCompleteSpaceUnreadSnapshot|HasCompleteSpaceUnreadConversationBaseline|FillPersonSpaceUnreadAndCollect|AggregateConversationSpaceUnreads|SyncUserConversationRespWrap|CountSpaceUnread|CountSpaceUnreads)' -count=1` → passed.
+  - `go test -race -ldflags='-s -w' ./modules/message -run 'Test(CanBuildCompleteSpaceUnreadSnapshot|HasCompleteSpaceUnreadConversationBaseline|FillPersonSpaceUnreadAndCollect|AggregateConversationSpaceUnreads|SyncUserConversationRespWrap|CountSpaceUnread|CountSpaceUnreads)' -count=1` → passed.
+  - `go vet ./modules/message/... ./pkg/space/...` → passed.
   - `go build ./...` → passed.
   - `ruby -e 'require "yaml"; YAML.load_file("modules/message/swagger/conversation.yaml")'` → passed.
   - `git diff --check` → passed.
@@ -17,6 +17,7 @@
   - The existing `space_last_message` preview fallback remains outside this change and retains its pre-PR request bounds.
   - Legacy groups/threads without `space_id` use the existing default-Space ownership rule.
   - Incremental/empty request shapes and truncated DM windows omit the authoritative snapshot.
+  - A WuKongIM conversation baseline at or above the pinned 1000-row `conversation.userMaxCount` is treated as potentially truncated and omits the optional snapshot without changing the normal conversation response.
   - Tagged and untagged unread from a non-system Bot both make the authoritative snapshot incomplete because send-time tags cannot prove current membership; existing current-Space unread and preview behavior remains unchanged.
   - Space-scoped Person channel IDs are normalized to their bare peer UID before user, mute, and Bot metadata lookup; tagged Bot unread cannot bypass the fail-closed snapshot rule.
   - App Bots are covered by the same `user.robot=1` classification: creation rolls back the `app_bot` row if the required user row cannot be created, startup repairs legacy published Bots, and deletion preserves the user row for historical message metadata and mute settings. The status-filtered `appBotUIDs` lookup is presentation-only.

@@ -526,6 +526,13 @@ func TestCanBuildCompleteSpaceUnreadSnapshot(t *testing.T) {
 	}
 }
 
+func TestHasCompleteSpaceUnreadConversationBaseline(t *testing.T) {
+	assert.True(t, hasCompleteSpaceUnreadConversationBaseline(0))
+	assert.True(t, hasCompleteSpaceUnreadConversationBaseline(pinnedWuKongIMConversationUserMaxCount-1))
+	assert.False(t, hasCompleteSpaceUnreadConversationBaseline(pinnedWuKongIMConversationUserMaxCount))
+	assert.False(t, hasCompleteSpaceUnreadConversationBaseline(pinnedWuKongIMConversationUserMaxCount+1))
+}
+
 func TestFillPersonSpaceUnreadAndCollect_ShortWindowIsIncomplete(t *testing.T) {
 	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
